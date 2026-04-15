@@ -1,0 +1,100 @@
+services:
+
+  # ── 1. MongoDB ─────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    # KHÔNG expose port ra ngoài — chỉ backend truy cập nội bộ
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── 2. GPU Service (Python Flask) ──────────────────────────────────────────
+  gpu_service:
+    build:
+      context: ./gpu_service          # thư mục chứa Dockerfile GPU
+      dockerfile: Dockerfile
+    image: sep490/gpu-service:latest
+    container_name: gpu_service
+    restart: unless-stopped
+    env_file:
+      - ./gpu_service.env             # file .env đã sửa DISABLE_NGROK=true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - checkpoint_data:/tmp/checkpoints
+      - upload_data:/app/dataset_uploads
+    shm_size: "2gb"
+    # KHÔNG expose port ra ngoài — chỉ backend gọi nội bộ
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/system/resources"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── 3. Backend (Node.js/Express) ───────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend             # thư mục chứa source backend
+      dockerfile: Dockerfile
+    image: sep490/backend:latest
+    container_name: backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env               # MONGO_URI=mongodb://mongodb:27017/...
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      gpu_service:
+        condition: service_healthy
+    # KHÔNG expose port ra ngoài — Nginx proxy nội bộ
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── 4. Frontend (React build → Nginx) ──────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend            # thư mục chứa source frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api           # frontend gọi /api → Nginx proxy → backend
+    image: sep490/frontend:latest
+    container_name: frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  # ── 5. Nginx (reverse proxy, điểm duy nhất ra internet) ────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"                      # ← CHỈ port này expose ra ngoài
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - frontend
+      - backend
+
+# ── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  mongo_data:        # dữ liệu MongoDB bền vững
+  checkpoint_data:   # model checkpoints
+  upload_data:       # dataset uploads của GPU service

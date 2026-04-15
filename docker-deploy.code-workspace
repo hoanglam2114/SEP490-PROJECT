@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "docker-deploy",
+			"path": ".."
+		},
+		{
+			"name": "gpu_service",
+			"path": "../../SEP490_WEBAPP-GPU_Service/gpu_service"
+		}
+	],
+	"settings": {}
+}
