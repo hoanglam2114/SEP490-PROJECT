@@ -55,7 +55,7 @@ export interface ShareGPTFormat {
 
 export type OutputFormat = 'openai' | 'anthropic' | 'alpaca' | 'sharegpt';
 
-export type FileType = 'chat' | 'lesson';
+export type FileType = 'chat' | 'lesson' | 'openai_messages';
 
 export interface ConversionOptions {
   format: OutputFormat;
@@ -79,7 +79,7 @@ export interface ConversionOptions {
   maxCharsAssistant?: number;    // Mặc định: 4000
   removeBoilerplate?: boolean;   // Xóa các câu trả lời mẫu của AI
   deduplicate?: boolean;         // Xóa các bản ghi trùng lặp
-  removeEmptyOutput?: boolean;   // Lọc bỏ mẫu không có Assistant content
+  removeUnclosedThink?: boolean; // Lọc những mẫu có <think> mà không có thẻ đóng </think>
   minTurns?: number;             // Số cặp hỏi đáp tối thiểu (QA pairs)
 }
 
@@ -89,6 +89,7 @@ export interface DataCleaningStats {
   removedTooShort: number;
   removedTooLong: number;
   removedDuplicates: number;
+  removedUnclosedThink?: number;
   finalCount: number;
 }
 

@@ -1,22 +1,23 @@
+# Sử dụng Node.js image
 FROM node:20-alpine
 
+# Thiết lập thư mục làm việc
 WORKDIR /app
 
-# Copy package files
-COPY package.json ./
+# Copy package.json và package-lock.json
+COPY package*.json ./
 
-# Install all deps (including devDeps for build)
-RUN npm install
+# Cài đặt dependencies
+RUN npm install --legacy-peer-deps
 
-# Copy source
+# Copy toàn bộ mã nguồn
 COPY . .
 
 # Build TypeScript
 RUN npm run build
 
-# Remove devDependencies after build
-RUN npm prune --production
-
+# Mở cổng 3000
 EXPOSE 3000
 
-CMD ["node", "dist/index.js"]
+# Chạy ứng dụng
+CMD ["npm", "start"]

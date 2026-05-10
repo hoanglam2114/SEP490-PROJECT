@@ -1,5 +1,16 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { apiService } from '../services/api';
+import { getAuthToken } from '../services/authSession';
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  CartesianGrid,
+} from 'recharts';
 
 interface TrainingHistoryItem {
   _id: string;
@@ -9,6 +20,9 @@ interface TrainingHistoryItem {
   datasetSource: string;
   datasetName: string;
   columnMapping: string;
+  systemPrompt?: string;
+  systemPromptVersion?: string;
+  datasetVersionId?: string;
   parameters: {
     batchSize: number;
     epochs: number;
@@ -33,6 +47,7 @@ interface TrainingHistoryItem {
   status: string;
   finalMetrics: {
     loss: number;
+    eval_loss?: number;
     accuracy: number;
     vram: number;
     gpu_util: number;
@@ -41,6 +56,8 @@ interface TrainingHistoryItem {
   trainingDuration: number;
   startedAt: string;
   completedAt: string;
+  lossHistory?: { progress: number; loss: number }[];
+  evalLossHistory?: { progress: number; loss: number }[];
   createdAt: string;
   latest_checkpoint_file_id?: string;
   workerUrl?: string;
@@ -68,6 +85,11 @@ function formatDate(dateStr: string): string {
   });
 }
 
+const getAuthHeaders = (): Record<string, string> => {
+  const token = getAuthToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+};
+
 export const TrainingHistoryScreen: React.FC = () => {
   const navigate = useNavigate();
   const [histories, setHistories] = useState<TrainingHistoryItem[]>([]);
@@ -79,16 +101,38 @@ export const TrainingHistoryScreen: React.FC = () => {
   const [baseModels, setBaseModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>('');
 
+  // Registry state
+  const [registries, setRegistries] = useState<any[]>([]);
+  const [showRegisterModal, setShowRegisterModal] = useState<string | null>(null); // jobId
+  const [selectedRegistryId, setSelectedRegistryId] = useState<string>('');
+  const [versionName, setVersionName] = useState<string>('v1.0.0');
+  const [promptVersion, setPromptVersion] = useState<string>('Default');
+  const [jobEvaluations, setJobEvaluations] = useState<any[]>([]);
+  const [selectedEvalId, setSelectedEvalId] = useState<string>('');
+  const [registering, setRegistering] = useState(false);
+
   // Fetch distinct base models for filter dropdown
   const fetchBaseModels = useCallback(async () => {
     try {
-      const res = await fetch('/api/train/history/models');
+      const res = await fetch('/api/train/history/models', {
+        headers: getAuthHeaders(),
+      });
       const data = await res.json();
       if (Array.isArray(data)) {
         setBaseModels(data);
       }
     } catch (err) {
       console.error('Failed to fetch base models:', err);
+    }
+  }, []);
+
+  const fetchRegistries = useCallback(async () => {
+    try {
+      const data = await apiService.listModelRegistries();
+      setRegistries(data);
+      if (data.length > 0) setSelectedRegistryId(data[0]._id);
+    } catch (err) {
+      console.error('Failed to fetch registries:', err);
     }
   }, []);
 
@@ -99,7 +143,9 @@ export const TrainingHistoryScreen: React.FC = () => {
       const url = modelFilter
         ? `/api/train/history?baseModel=${encodeURIComponent(modelFilter)}`
         : '/api/train/history';
-      const res = await fetch(url);
+      const res = await fetch(url, {
+        headers: getAuthHeaders(),
+      });
       const data = await res.json();
       setHistories(Array.isArray(data) ? data : []);
     } catch (err) {
@@ -113,7 +159,53 @@ export const TrainingHistoryScreen: React.FC = () => {
   useEffect(() => {
     fetchBaseModels();
     fetchHistories();
-  }, [fetchBaseModels, fetchHistories]);
+    fetchRegistries();
+  }, [fetchBaseModels, fetchHistories, fetchRegistries]);
+
+  const handleRegister = async (item: TrainingHistoryItem) => {
+    if (!selectedRegistryId) {
+      alert('Please select or create a model registry first.');
+      return;
+    }
+
+    setRegistering(true);
+    try {
+      await apiService.registerModelVersion({
+        modelRegistryId: selectedRegistryId,
+        version: versionName,
+        trainingHistoryId: item._id,
+        evaluationId: selectedEvalId || undefined,
+        hfRepoId: item.hfRepoId,
+        promptVersion: promptVersion,
+        notes: `Registered from training job ${item.jobId}`,
+      });
+      alert('Model registered successfully!');
+      setShowRegisterModal(null);
+    } catch (err: any) {
+      alert('Error registering model: ' + (err.response?.data?.message || err.message));
+    } finally {
+      setRegistering(false);
+    }
+  };
+
+  const openRegisterModal = async (item: TrainingHistoryItem) => {
+    const itemSnapshot = histories.find(h => h.jobId === item.jobId) || item;
+    setShowRegisterModal(item.jobId);
+    setVersionName('v1.0.0');
+    setPromptVersion(itemSnapshot.systemPromptVersion || 'Default');
+    setSelectedEvalId('');
+    setJobEvaluations([]);
+    
+    try {
+      const evals = await apiService.getEvaluationsByJob(item.jobId);
+      setJobEvaluations(evals);
+      if (evals.length > 0) {
+        setSelectedEvalId(evals[0]._id);
+      }
+    } catch (error) {
+      console.error('Error fetching job evaluations:', error);
+    }
+  };
 
   // When selected model changes, fetch filtered data
   const handleModelFilterChange = (model: string) => {
@@ -126,7 +218,10 @@ export const TrainingHistoryScreen: React.FC = () => {
     if (!confirm('Are you sure you want to delete this training record?')) return;
     setDeleteLoading(jobId);
     try {
-      await fetch(`/api/train/history/${jobId}`, { method: 'DELETE' });
+      await fetch(`/api/train/history/${jobId}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+      });
       setHistories(prev => prev.filter(h => h.jobId !== jobId));
       if (expandedId === jobId) setExpandedId(null);
       // Refresh base models list in case we deleted the last record for a model
@@ -144,7 +239,10 @@ export const TrainingHistoryScreen: React.FC = () => {
     e.stopPropagation();
     setResumeLoading(jobId);
     try {
-      const res = await fetch(`/api/train/resume/${jobId}`, { method: 'POST' });
+      const res = await fetch(`/api/train/resume/${jobId}`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || 'Failed to resume training');
@@ -156,6 +254,35 @@ export const TrainingHistoryScreen: React.FC = () => {
     } finally {
       setResumeLoading(null);
     }
+  };
+
+  const getChartData = (item: TrainingHistoryItem) => {
+    if (!item.lossHistory) return [];
+    
+    // Combine lossHistory and evalLossHistory
+    const combinedData = [...item.lossHistory.map(h => ({
+      progress: Math.round(h.progress),
+      loss: h.loss,
+      evalLoss: undefined as number | undefined
+    }))];
+
+    if (item.evalLossHistory) {
+      item.evalLossHistory.forEach(eh => {
+        const roundedProg = Math.round(eh.progress);
+        const existing = combinedData.find(d => d.progress === roundedProg);
+        if (existing) {
+          existing.evalLoss = eh.loss;
+        } else {
+          combinedData.push({
+            progress: roundedProg,
+            loss: undefined as any,
+            evalLoss: eh.loss
+          });
+        }
+      });
+    }
+
+    return combinedData.sort((a, b) => a.progress - b.progress);
   };
 
   const statusStyle = (status: string) => {
@@ -202,19 +329,31 @@ export const TrainingHistoryScreen: React.FC = () => {
               <p className="text-xs text-slate-400 mt-0.5">View all past training runs</p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-400 bg-slate-100 px-2 py-1 rounded-lg">
-              {histories.length} record{histories.length !== 1 ? 's' : ''}
-            </span>
+          <div className="flex items-center gap-3">
             <button
-              onClick={() => fetchHistories(selectedModel || undefined)}
-              className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-all"
-              title="Refresh"
+              onClick={() => navigate("/model-eval/run")}
+              className="flex items-center gap-2 px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-100 rounded-xl text-sm font-semibold transition-all"
+              title="Go to Model Evaluation"
             >
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
               </svg>
+              Evaluation
             </button>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-400 bg-slate-100 px-2 py-1 rounded-lg">
+                {histories.length} record{histories.length !== 1 ? 's' : ''}
+              </span>
+              <button
+                onClick={() => fetchHistories(selectedModel || undefined)}
+                className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-all"
+                title="Refresh"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -383,47 +522,138 @@ export const TrainingHistoryScreen: React.FC = () => {
                           </div>
                         </div>
 
-                        {/* Details */}
-                        <div className="space-y-3">
-                          <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Details</h4>
-                          <div className="space-y-2 text-sm">
-                            <div className="flex justify-between">
-                              <span className="text-slate-500">Job ID</span>
-                              <span className="text-slate-700 font-mono text-xs">{item.jobId}</span>
+                        {/* Chart or Details */}
+                        <div className="space-y-4">
+                          {item.lossHistory && item.lossHistory.length > 0 ? (
+                            <div className="bg-white border border-slate-200 rounded-xl p-4 h-64 shadow-inner">
+                              <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Loss Curve</h4>
+                              <ResponsiveContainer width="100%" height="85%">
+                                <LineChart data={getChartData(item)}>
+                                  <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                                  <XAxis 
+                                    dataKey="progress" 
+                                    tick={{ fontSize: 10, fill: '#94a3b8' }} 
+                                    tickFormatter={(v) => `${v}%`}
+                                  />
+                                  <YAxis 
+                                    tick={{ fontSize: 10, fill: '#94a3b8' }} 
+                                    domain={['auto', 'auto']}
+                                  />
+                                  <Tooltip 
+                                    contentStyle={{ fontSize: '12px', borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                                    labelFormatter={(v) => `Progress: ${v}%`}
+                                  />
+                                  <Line 
+                                    type="monotone" 
+                                    dataKey="loss" 
+                                    name="Training Loss"
+                                    stroke="#2563eb" 
+                                    strokeWidth={2} 
+                                    dot={false}
+                                  />
+                                  <Line 
+                                    type="monotone" 
+                                    dataKey="evalLoss" 
+                                    name="Eval Loss (Overfit)"
+                                    stroke="#ef4444" 
+                                    strokeWidth={2} 
+                                    dot={false}
+                                  />
+                                </LineChart>
+                              </ResponsiveContainer>
                             </div>
-                            <div className="flex justify-between">
-                              <span className="text-slate-500">Base Model</span>
-                              <span className="text-slate-700 text-xs font-medium">{item.baseModel}</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span className="text-slate-500">Dataset</span>
-                              <span className="text-slate-700">{item.datasetName} ({item.datasetSource})</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span className="text-slate-500">Column Mapping</span>
-                              <span className="text-slate-700">{item.columnMapping}</span>
-                            </div>
-                            {item.pushToHub && (
-                              <div className="flex justify-between">
-                                <span className="text-slate-500">HF Repo</span>
-                                <span className="text-slate-700">{item.hfRepoId}</span>
+                          ) : (
+                            <div>
+                              <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Details</h4>
+                              <div className="space-y-2 text-sm">
+                                <div className="flex justify-between">
+                                  <span className="text-slate-500">Job ID</span>
+                                  <span className="text-slate-700 font-mono text-xs">{item.jobId}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span className="text-slate-500">Base Model</span>
+                                  <span className="text-slate-700 text-xs font-medium">{item.baseModel}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span className="text-slate-500">Dataset</span>
+                                  <span className="text-slate-700">{item.datasetName} ({item.datasetSource})</span>
+                                </div>
+                                {item.datasetVersionId && (
+                                  <div className="flex justify-between">
+                                    <span className="text-slate-500 text-xs">Dataset Ver ID</span>
+                                    <span className="text-slate-700 font-mono text-[10px]">{item.datasetVersionId}</span>
+                                  </div>
+                                )}
+                                {item.systemPromptVersion && (
+                                  <div className="flex justify-between">
+                                    <span className="text-slate-500 text-xs">Prompt Version</span>
+                                    <span className="text-slate-700 font-semibold">{item.systemPromptVersion}</span>
+                                  </div>
+                                )}
+                                {item.systemPrompt && (
+                                  <div className="space-y-1">
+                                    <span className="text-slate-500 text-xs">System Prompt</span>
+                                    <div className="bg-white border border-slate-200 rounded-lg p-3 text-xs text-slate-700 max-h-32 overflow-y-auto italic">
+                                      {item.systemPrompt}
+                                    </div>
+                                  </div>
+                                )}
+                                <div className="flex justify-between">
+                                  <span className="text-slate-500">Training Duration</span>
+                                  <span className="text-slate-700 font-semibold">{formatDuration(item.trainingDuration)}</span>
+                                </div>
                               </div>
-                            )}
-                            <div className="flex justify-between">
-                              <span className="text-slate-500">Training Duration</span>
-                              <span className="text-slate-700 font-semibold">{formatDuration(item.trainingDuration)}</span>
                             </div>
-                            <div className="flex justify-between">
-                              <span className="text-slate-500">Started At</span>
-                              <span className="text-slate-700">{formatDate(item.startedAt)}</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span className="text-slate-500">Completed At</span>
-                              <span className="text-slate-700">{formatDate(item.completedAt)}</span>
-                            </div>
-                          </div>
+                          )}
                         </div>
                       </div>
+
+                      {/* Full Info Details if Chart was shown */}
+                      {item.lossHistory && item.lossHistory.length > 0 && (
+                        <div className="bg-white/50 border border-slate-100 rounded-xl p-4 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-y-3 gap-x-6 text-sm">
+                          <div className="flex flex-col">
+                            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter">Job ID</span>
+                            <span className="text-slate-700 font-mono text-xs">{item.jobId}</span>
+                          </div>
+                          <div className="flex flex-col">
+                            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter">Dataset</span>
+                            <span className="text-slate-700">{item.datasetName}</span>
+                          </div>
+                          {item.datasetVersionId && (
+                            <div className="flex flex-col">
+                              <span className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter">Dataset ID</span>
+                              <span className="text-slate-700 font-mono text-[10px] truncate">{item.datasetVersionId}</span>
+                            </div>
+                          )}
+                          {item.systemPromptVersion && (
+                            <div className="flex flex-col">
+                              <span className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter">Prompt Version</span>
+                              <span className="text-slate-700 font-semibold">{item.systemPromptVersion}</span>
+                            </div>
+                          )}
+                          <div className="flex flex-col">
+                            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter">Duration</span>
+                            <span className="text-slate-700 font-semibold">{formatDuration(item.trainingDuration)}</span>
+                          </div>
+                          <div className="flex flex-col">
+                            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter">Started</span>
+                            <span className="text-slate-700">{formatDate(item.startedAt)}</span>
+                          </div>
+                          <div className="flex flex-col">
+                            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter">Completed</span>
+                            <span className="text-slate-700">{formatDate(item.completedAt)}</span>
+                          </div>
+
+                          {item.systemPrompt && (
+                            <div className="flex flex-col col-span-1 sm:col-span-2 md:col-span-3 pt-2 border-t border-slate-100">
+                              <span className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter mb-1">System Prompt</span>
+                              <div className="bg-white border border-slate-200 rounded-lg p-3 text-xs text-slate-600 italic max-h-32 overflow-y-auto shadow-inner">
+                                {item.systemPrompt}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
 
                       {/* Last Log Line */}
                       {item.lastLogLine && (
@@ -442,6 +672,17 @@ export const TrainingHistoryScreen: React.FC = () => {
 
                       {/* Action Buttons */}
                       <div className="flex justify-end pt-2 gap-3">
+                        {item.status === 'COMPLETED' && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); openRegisterModal(item); }}
+                            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-600 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-all"
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                            </svg>
+                            Register Model
+                          </button>
+                        )}
                         {(item.status === 'STOPPED' || item.status === 'FAILED' || item.status === 'RUNNING') && (
                           <button
                             onClick={(e) => handleResume(e, item.jobId)}
@@ -502,6 +743,99 @@ export const TrainingHistoryScreen: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Register Model Modal */}
+      {showRegisterModal && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 border border-slate-200">
+            <h2 className="text-xl font-bold text-slate-800 mb-6 flex items-center gap-2">
+              <span className="text-2xl">📦</span> Register Model Version
+            </h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-1.5">Select Model Registry</label>
+                {registries.length > 0 ? (
+                  <select
+                    value={selectedRegistryId}
+                    onChange={(e) => setSelectedRegistryId(e.target.value)}
+                    className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none bg-slate-50 text-sm"
+                  >
+                    {registries.map((r) => (
+                      <option key={r._id} value={r._id}>{r.name} ({r.baseModel})</option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="text-sm text-amber-600 bg-amber-50 p-3 rounded-xl border border-amber-100">
+                    No registries found. Please <a href="/model-registry" className="underline font-bold">create one</a> first.
+                  </div>
+                )}
+              </div>
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-1.5">Version Name</label>
+                <input
+                  type="text"
+                  value={versionName}
+                  onChange={(e) => setVersionName(e.target.value)}
+                  className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none bg-slate-50 text-sm font-mono"
+                  placeholder="e.g., v1.0.0"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-1.5">Prompt Version</label>
+                <input
+                  type="text"
+                  value={promptVersion}
+                  onChange={(e) => setPromptVersion(e.target.value)}
+                  className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none bg-slate-50 text-sm font-mono"
+                  placeholder="e.g., Default / V1.1"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-1.5">Link Evaluation Result</label>
+                {jobEvaluations.length > 0 ? (
+                  <select
+                    value={selectedEvalId}
+                    onChange={(e) => setSelectedEvalId(e.target.value)}
+                    className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none bg-slate-50 text-sm"
+                  >
+                    {jobEvaluations.map((ev) => (
+                      <option key={ev._id} value={ev._id}>
+                        {ev.modelEvalId} ({ev.judgeModel}) - {new Date(ev.createdAt).toLocaleDateString()}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="text-xs text-slate-500 italic bg-slate-50 p-2 rounded-lg border border-slate-100">
+                    No evaluations found for this job.
+                  </div>
+                )}
+              </div>
+              
+              <div className="pt-4 flex gap-3">
+                <button
+                  onClick={() => setShowRegisterModal(null)}
+                  className="flex-1 px-4 py-2.5 border border-slate-200 text-slate-600 rounded-xl hover:bg-slate-50 font-medium transition-all text-sm"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    const item = histories.find(h => h.jobId === showRegisterModal);
+                    if (item) handleRegister(item);
+                  }}
+                  disabled={registering || registries.length === 0}
+                  className="flex-1 px-4 py-2.5 bg-blue-600 text-white rounded-xl hover:bg-blue-700 font-medium transition-all shadow-lg shadow-blue-500/25 disabled:opacity-50 text-sm flex items-center justify-center gap-2"
+                >
+                  {registering && <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>}
+                  Register Version
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

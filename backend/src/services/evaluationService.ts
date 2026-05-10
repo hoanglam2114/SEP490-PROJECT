@@ -1,6 +1,6 @@
 import { ILlmProvider } from './providers/ILlmProvider';
 import { AlpacaFormat } from '../types';
-import { ALPACA_SYSTEM_PROMPT, OPENAI_SYSTEM_PROMPT } from '../constants/prompts';
+import { ALPACA_SYSTEM_PROMPT, OPENAI_SYSTEM_PROMPT, REFINEMENT_SYSTEM_PROMPT, REWRITE_SYSTEM_PROMPT } from '../constants/prompts';
 import { GeminiProvider } from './providers/GeminiProvider';
 
 export interface SampleEvaluation {
@@ -44,12 +44,80 @@ export interface OpenAIConversationSample {
 // Union type: either a flat Alpaca sample or a full OpenAI conversation
 export type EvaluationSample = AlpacaFormat | OpenAIConversationSample;
 
+export interface ConversationTurn {
+    user: string;
+    assistant: string;
+}
+
+export interface RefinementSample {
+    assistant: string | Array<ConversationTurn>;
+    reason: string;
+}
+
+export interface RefinementResultItem {
+    assistant: string | Array<ConversationTurn>;
+    refinedOutput: string | Array<ConversationTurn>;
+}
+
+export interface RewriteTurn {
+    userMessageIndex: number;
+    assistantMessageIndex: number;
+    user: string;
+    assistant: string;
+    userLabels: string[];
+    assistantLabels: string[];
+    expectedActions: string[];
+    matched: boolean;
+}
+
+export interface RewriteSample {
+    turns: RewriteTurn[];
+}
+
+export interface RewriteResultItem {
+    rewrites: Array<{
+        assistantMessageIndex: number;
+        assistant: string;
+    }>;
+}
+
 function isConversationSample(s: EvaluationSample): s is OpenAIConversationSample {
     return Array.isArray((s as OpenAIConversationSample).messages);
 }
-
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 export class EvaluationService {
     constructor(private provider: ILlmProvider) { }
+
+    private static readonly MAX_MESSAGES_PER_CONVERSATION = 16;
+    private static readonly MAX_MESSAGE_CHARS = 800;
+
+    private compactText(content: string, maxChars = EvaluationService.MAX_MESSAGE_CHARS): string {
+        const text = String(content || '');
+        if (text.length <= maxChars) {
+            return text;
+        }
+
+        const head = text.slice(0, Math.floor(maxChars * 0.7));
+        const tail = text.slice(-Math.floor(maxChars * 0.3));
+        return `${head}\n...[truncated]...\n${tail}`;
+    }
+
+    private compactMessages(messages: Array<{ role: string; content: string }>): Array<{ role: string; content: string }> {
+        const normalized = messages.map((m) => ({
+            role: String(m?.role || ''),
+            content: this.compactText(String(m?.content || '')),
+        }));
+
+        if (normalized.length <= EvaluationService.MAX_MESSAGES_PER_CONVERSATION) {
+            return normalized;
+        }
+
+        const half = Math.floor(EvaluationService.MAX_MESSAGES_PER_CONVERSATION / 2);
+        return [
+            ...normalized.slice(0, half),
+            ...normalized.slice(-half),
+        ];
+    }
 
     private toInstructionOutput(sample: EvaluationSample): { instruction: string; output: string } {
         if (isConversationSample(sample)) {
@@ -82,10 +150,7 @@ export class EvaluationService {
                 if (isConversationSample(s)) {
                     return {
                         index,
-                        messages: s.messages.map((m) => ({
-                            role: String(m.role || ''),
-                            content: String(m.content || ''),
-                        })),
+                        messages: this.compactMessages(s.messages || []),
                     };
                 }
 
@@ -107,7 +172,7 @@ export class EvaluationService {
                 };
             });
 
-        const samplesJson = JSON.stringify(batchPayload, null, 2);
+        const samplesJson = JSON.stringify(batchPayload);
         const prompt = isOpenAI
             ? OPENAI_SYSTEM_PROMPT.replace('${samplesJson}', samplesJson)
             : ALPACA_SYSTEM_PROMPT.replace('${samplesJson}', samplesJson);
@@ -115,11 +180,12 @@ export class EvaluationService {
         try {
             const rawText = await this.provider.generateContent(prompt);
 
-            let jsonString = rawText;
-            const jsonMatch = rawText.match(/\[[\s\S]*\]/);
-            if (jsonMatch) {
-                jsonString = jsonMatch[0];
-            }
+            // Robust JSON extraction: Find first [ and last ]
+            const firstBracket = rawText.indexOf('[');
+            const lastBracket = rawText.lastIndexOf(']');
+            let jsonString = (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket)
+                ? rawText.substring(firstBracket, lastBracket + 1)
+                : rawText;
 
             let parsedArray: any[];
             try {
@@ -175,6 +241,14 @@ export class EvaluationService {
             });
 
         } catch (error: any) {
+            const statusCode = Number(error?.response?.status || 0);
+            if (statusCode === 413 && samples.length > 1) {
+                const mid = Math.ceil(samples.length / 2);
+                const left = await this.evaluateChunk(samples.slice(0, mid), format);
+                const right = await this.evaluateChunk(samples.slice(mid), format);
+                return [...left, ...right];
+            }
+
             console.error('Eval error for chunk:', error.message);
             return samples.map((sample) => {
                 const { instruction, output } = this.toInstructionOutput(sample);
@@ -197,12 +271,11 @@ export class EvaluationService {
         format?: string
     ): Promise<EvaluationResult> {
         const populationSize = data.length;
-        const sampleSize = Math.min(10, populationSize);
-        const samples = data.slice(0, sampleSize);
-        console.log(`[Evaluation] Lấy ${sampleSize} mẫu đầu tiên: population=${populationSize}, samples=${samples.length}`);
-
-        const CHUNK_SIZE = 10;
+        const samples = Array.isArray(data) ? data : [];
+        console.log(`[Evaluation] Lấy mẫu để chấm: population=${populationSize}, samples=${samples.length}`);
+        const CHUNK_SIZE = 5;
         const results: SampleEvaluation[] = [];
+
 
         console.log(`[Evaluation] Bắt đầu xử lý batching: ${Math.ceil(samples.length / CHUNK_SIZE)} chunk(s)`);
 
@@ -212,6 +285,7 @@ export class EvaluationService {
 
             const chunkResults = await this.evaluateChunk(chunk, format);
             results.push(...chunkResults);
+
         }
 
         const evaluated = results.length;
@@ -249,6 +323,192 @@ export class EvaluationService {
             passRate,
             samples: results,
         };
+    }
+
+    async refineBatch(data: RefinementSample[]): Promise<RefinementResultItem[]> {
+        if (!data.length) {
+            return [];
+        }
+
+        const CHUNK_SIZE = 5;
+        const results: RefinementResultItem[] = [];
+
+        for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+            const chunk = data.slice(i, i + CHUNK_SIZE);
+            const payload = chunk.map((item, index) => ({
+                index,
+                assistant: typeof item.assistant === 'object' ? item.assistant : String(item.assistant || ''),
+                reason: String(item.reason || ''),
+            }));
+
+            const prompt = REFINEMENT_SYSTEM_PROMPT.replace('${samplesJson}', JSON.stringify(payload, null, 2));
+
+            try {
+                const rawText = await this.provider.generateContent(prompt);
+                
+                // Robust JSON extraction: Find first [ and last ]
+                const firstBracket = rawText.indexOf('[');
+                const lastBracket = rawText.lastIndexOf(']');
+                let jsonString = (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket)
+                    ? rawText.substring(firstBracket, lastBracket + 1)
+                    : rawText;
+                
+                let parsed: any;
+                try {
+                    parsed = JSON.parse(jsonString);
+                } catch (parseErr: any) {
+                    console.error("[RefineBatch] JSON Parse failed. Error:", parseErr.message);
+                    console.error("[RefineBatch] Raw text snippet:", rawText.substring(0, 500) + "...");
+                    // Try to recover by trimming or other means if necessary, 
+                    // or just fallback to empty array for this chunk
+                    parsed = [];
+                }
+
+                const arr = Array.isArray(parsed) ? parsed : [parsed];
+
+                const mapped = new Map<number, any>();
+                arr.forEach((item, idx) => {
+                    const itemIndex = Number(item?.index);
+                    if (Number.isFinite(itemIndex)) {
+                        mapped.set(itemIndex, item);
+                    } else {
+                        mapped.set(idx, item);
+                    }
+                });
+
+                chunk.forEach((original, idx) => {
+                    const responseItem = mapped.get(idx);
+                    if (!responseItem || !responseItem.refinedOutput) {
+                        throw new Error(`AI xử lý thất bại hoặc không trả về nội dung đã Refine cho mẫu (index = ${idx}).`);
+                    }
+
+                    let refinedOutput = responseItem.refinedOutput;
+
+                    // Fallback to parse if LLM returns stringified JSON string (common with Deepseek)
+                    if (typeof refinedOutput === 'string') {
+                        const trimmed = refinedOutput.trim();
+                        if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+                            try {
+                                refinedOutput = JSON.parse(trimmed);
+                            } catch (e) {
+                                // ignore
+                            }
+                        }
+                    }
+
+                    // Unwrap double array if LLM returns [[{}]] (common with Deepseek logic confusion)
+                    if (Array.isArray(refinedOutput) && refinedOutput.length === 1 && Array.isArray(refinedOutput[0])) {
+                        refinedOutput = refinedOutput[0];
+                    }
+
+                    if (typeof refinedOutput === 'string') {
+                        refinedOutput = refinedOutput.trim();
+                    }
+
+                    results.push({
+                        assistant: original.assistant,
+                        refinedOutput,
+                    });
+                });
+            } catch (error: any) {
+                console.error("[RefineBatch] Lỗi khi refine dữ liệu:", error.message);
+                throw error;
+            }
+            if (i + CHUNK_SIZE < data.length) {
+                console.log(`[Evaluation] Đang nghỉ 4 giây để tránh lỗi 429...`);
+                await delay(4000);
+            }
+        }
+
+        return results;
+    }
+
+    async rewriteBatch(data: RewriteSample[]): Promise<RewriteResultItem[]> {
+        if (!data.length) {
+            return [];
+        }
+
+        const CHUNK_SIZE = 5;
+        const results: RewriteResultItem[] = [];
+
+        for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+            const chunk = data.slice(i, i + CHUNK_SIZE);
+            const payload = chunk.map((item, index) => ({
+                index,
+                turns: item.turns.map((turn) => ({
+                    userMessageIndex: Number(turn.userMessageIndex),
+                    assistantMessageIndex: Number(turn.assistantMessageIndex),
+                    user: String(turn.user || ''),
+                    assistant: String(turn.assistant || ''),
+                    userLabels: Array.isArray(turn.userLabels) ? turn.userLabels.map((label) => String(label || '')) : [],
+                    assistantLabels: Array.isArray(turn.assistantLabels) ? turn.assistantLabels.map((label) => String(label || '')) : [],
+                    expectedActions: Array.isArray(turn.expectedActions) ? turn.expectedActions.map((label) => String(label || '')) : [],
+                    matched: Boolean(turn.matched),
+                })),
+            }));
+
+            const prompt = REWRITE_SYSTEM_PROMPT.replace('${samplesJson}', JSON.stringify(payload, null, 2));
+
+            try {
+                const rawText = await this.provider.generateContent(prompt);
+                const firstBracket = rawText.indexOf('[');
+                const lastBracket = rawText.lastIndexOf(']');
+                const jsonString = (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket)
+                    ? rawText.substring(firstBracket, lastBracket + 1)
+                    : rawText;
+
+                let parsed: any;
+                try {
+                    parsed = JSON.parse(jsonString);
+                } catch (parseErr: any) {
+                    console.error('[RewriteBatch] JSON Parse failed. Error:', parseErr.message);
+                    console.error('[RewriteBatch] Raw text snippet:', rawText.substring(0, 500) + '...');
+                    parsed = [];
+                }
+
+                const arr = Array.isArray(parsed) ? parsed : [parsed];
+                const mapped = new Map<number, any>();
+                arr.forEach((item, idx) => {
+                    const itemIndex = Number(item?.index);
+                    if (Number.isFinite(itemIndex)) {
+                        mapped.set(itemIndex, item);
+                    } else {
+                        mapped.set(idx, item);
+                    }
+                });
+
+                chunk.forEach((original, idx) => {
+                    const responseItem = mapped.get(idx) || {};
+                    const rewrites = Array.isArray(responseItem?.rewrites) ? responseItem.rewrites : [];
+                    const normalizedRewrites = rewrites
+                        .map((rewrite: any) => ({
+                            assistantMessageIndex: Number(rewrite?.assistantMessageIndex),
+                            assistant: String(rewrite?.assistant || '').trim(),
+                        }))
+                        .filter((rewrite: { assistantMessageIndex: number; assistant: string }) => Number.isFinite(rewrite.assistantMessageIndex) && rewrite.assistant);
+
+                    const allowedIndices = new Set(
+                        original.turns
+                            .filter((turn: RewriteTurn) => !turn.matched)
+                            .map((turn: RewriteTurn) => Number(turn.assistantMessageIndex))
+                    );
+
+                    results.push({
+                        rewrites: normalizedRewrites.filter((rewrite: { assistantMessageIndex: number; assistant: string }) => allowedIndices.has(rewrite.assistantMessageIndex)),
+                    });
+                });
+            } catch (error: any) {
+                console.error('[RewriteBatch] Error when rewriting data:', error.message);
+                throw error;
+            }
+
+            if (i + CHUNK_SIZE < data.length) {
+                console.log(`[Rewrite] Waiting 4 seconds to avoid rate limits...`);
+                await delay(4000);
+            }
+        }
+
+        return results;
     }
 }
 

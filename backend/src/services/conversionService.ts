@@ -98,7 +98,7 @@ export class ConversionService {
     // Xóa mọi dòng chứa ENCOURAGE_EXERCISE 
     cleaned = cleaned.split('\n').filter(line => !line.match(/ENCOURAGE_EXERCISE|Status 'ENCOURAGE_EXERCISE'|Lỗi: Status 'ENCOURAGE_EXERCISE'/i)).join('\n');
     // Xóa tất cả emoji unicode
-    cleaned = cleaned.replace(/[\p{Emoji}\p{Extended_Pictographic}]/gu, '');
+    // cleaned = cleaned.replace(/\p{Extended_Pictographic}/gu, '');
     return cleaned.trim();
   }
 
@@ -309,6 +309,40 @@ export class ConversionService {
   }
 
   /**
+   * Convert OpenAI messages format sang Alpaca format
+   */
+  openAIToAlpaca(data: OpenAIFormat[], options: ConversionOptions): AlpacaFormat[] {
+    const results: AlpacaFormat[] = [];
+
+    data.forEach((item) => {
+      if (!item.messages || !Array.isArray(item.messages)) return;
+
+      const messages = item.messages;
+      for (let i = 0; i < messages.length; i++) {
+        const current = messages[i];
+        if (current.role !== 'user') continue;
+
+        // Find the next assistant message
+        const nextAssistant = messages.slice(i + 1).find(msg => msg.role === 'assistant');
+        if (nextAssistant) {
+          const instruction = this.cleanContent(current.content, options.removeThinkTags || false);
+          const output = this.cleanContent(nextAssistant.content, options.removeThinkTags || false);
+
+          if (instruction && output) {
+            results.push({
+              instruction,
+              input: '',
+              output,
+            });
+          }
+        }
+      }
+    });
+
+    return results;
+  }
+
+  /**
    * Convert sang ShareGPT format
    */
   toShareGPTFormat(
@@ -356,6 +390,7 @@ export class ConversionService {
       removedTooShort: 0,
       removedTooLong: 0,
       removedDuplicates: 0,
+      removedUnclosedThink: 0,
       finalCount: 0,
     };
 
@@ -425,14 +460,15 @@ export class ConversionService {
     stats.removedTooLong = tooLong.length;
 
 
-    // --- BƯỚC 5: REMOVE EMPTY OUTPUT ---
-    if (options.removeEmptyOutput) {
+    // --- BƯỚC 5: REMOVE UNCLOSED THINK ---
+    if (options.removeUnclosedThink) {
       const before = cleaned.length;
       cleaned = cleaned.filter((item) => {
-        const assistantText = item.output.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-        return assistantText.length > 0;
+        const hasOpen = item.output.includes('<think>');
+        const hasClose = item.output.includes('</think>');
+        return !(hasOpen && !hasClose);
       });
-      stats.removedTooShort += before - cleaned.length;
+      stats.removedUnclosedThink = before - cleaned.length;
     }
 
     // --- BƯỚC 6: MIN TURNS ---
@@ -465,6 +501,7 @@ export class ConversionService {
       removedTooShort: 0,
       removedTooLong: 0,
       removedDuplicates: 0,
+      removedUnclosedThink: 0,
       finalCount: 0,
     };
 
@@ -483,19 +520,21 @@ export class ConversionService {
       "Không tìm thấy agent",
       "Status",
       "not supported by",
-      "__CHUNK__"
+      "__CHUNK__",
+      "Exception",
+      "Vui lòng thử lại.",
     ];
 
-    const BOILERPLATE_PATTERNS = [
-      /^(xin lỗi|sorry)[,.]?\s*(tôi|i)\s*(không thể|cannot|can't|am unable)/i,
-      /^(là một|as an?)\s*(AI|mô hình|model|language model)/i,
-      /^(I|Tôi)\s*(don't|không)\s*(have|có)\s*(access|quyền truy cập)/i,
-      /^(I|Tôi)\s*(am|là)\s*(just|chỉ là)\s*(an?|một)\s*(AI|mô hình)/i,
-      /tôi không được huấn luyện để/i,
-      /i (was|have been) (not |)trained to/i,
-      /^(Okay|Được rồi|Sure|Chắc chắn)[!,.]?\s*$/i,
-      /^(I understand|Tôi hiểu)[.!]?\s*$/i,
-    ];
+    // const BOILERPLATE_PATTERNS = [
+    //   /^(xin lỗi|sorry)[,.]?\s*(tôi|i)\s*(không thể|cannot|can't|am unable)/i,
+    //   /^(là một|as an?)\s*(AI|mô hình|model|language model)/i,
+    //   /^(I|Tôi)\s*(don't|không)\s*(have|có)\s*(access|quyền truy cập)/i,
+    //   /^(I|Tôi)\s*(am|là)\s*(just|chỉ là)\s*(an?|một)\s*(AI|mô hình)/i,
+    //   /tôi không được huấn luyện để/i,
+    //   /i (was|have been) (not |)trained to/i,
+    //   /^(Okay|Được rồi|Sure|Chắc chắn)[!,.]?\s*$/i,
+    //   /^(I understand|Tôi hiểu)[.!]?\s*$/i,
+    // ];
 
     if (options.removeBoilerplate !== false) {
       const before = cleaned.length;
@@ -504,8 +543,8 @@ export class ConversionService {
         return !item.messages.some(msg => {
           if (msg.role !== 'assistant') return false;
           const hasError = ERROR_KEYWORDS.some(keyword => msg.content.includes(keyword));
-          const hasBoilerplate = BOILERPLATE_PATTERNS.some(regex => regex.test(msg.content.trim()));
-          return hasError || hasBoilerplate;
+          // const hasBoilerplate = BOILERPLATE_PATTERNS.some(regex => regex.test(msg.content.trim()));
+          return hasError; // || hasBoilerplate;
         });
       });
       stats.removedBoilerplate = before - cleaned.length;
@@ -558,17 +597,18 @@ export class ConversionService {
     stats.removedTooLong = tooLong.length;
 
 
-    // BƯỚC 4: REMOVE EMPTY ASSISTANT CONTENT
-    if (options.removeEmptyOutput) {
+    // BƯỚC 4: REMOVE UNCLOSED THINK
+    if (options.removeUnclosedThink) {
       const before = cleaned.length;
       cleaned = cleaned.filter((item) => {
         return item.messages.every(msg => {
           if (msg.role !== 'assistant') return true;
-          const assistantText = msg.content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-          return assistantText.length > 0;
+          const hasOpen = msg.content.includes('<think>');
+          const hasClose = msg.content.includes('</think>');
+          return !(hasOpen && !hasClose);
         });
       });
-      stats.removedTooShort += before - cleaned.length;
+      stats.removedUnclosedThink = before - cleaned.length;
     }
 
     // BƯỚC 5: MIN TURNS

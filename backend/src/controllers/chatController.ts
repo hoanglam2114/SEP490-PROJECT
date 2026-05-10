@@ -1,38 +1,156 @@
 import { Request, Response } from 'express';
-import fetch from 'node-fetch'; // assuming node-fetch is available based on package.json
+const fetch = async (url: any, init?: any) => {
+  const module = await import('node-fetch');
+  return module.default(url, init);
+};
 import { ChatHistory } from '../models/ChatHistory';
+import { OpenRouterProvider } from '../services/providers/OpenRouterProvider';
+import { ModelVersion, ModelVersionStatus } from '../models/ModelVersion';
+import { getAuthUserId } from '../utils/auth';
+import { configService } from '../services/configService';
 
-const gpuServiceUrl = process.env.GPU_SERVICE_URL ? process.env.GPU_SERVICE_URL.replace(/\/$/, '') : 'http://localhost:5000';
-// Single Colab handles both slots via instance_id in body — GPU_SERVICE_URL_2 no longer needed.
-const getGpuUrl = (_instanceId?: number) => gpuServiceUrl;
+const getGpuUrl = (instanceId?: number) => configService.getGpuUrl(instanceId);
 
+type GpuHistoryMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+};
+
+const normalizeHistory = (history: unknown): GpuHistoryMessage[] => {
+  if (!Array.isArray(history)) {
+    return [];
+  }
+
+  return history
+    .map((item: any) => {
+      const role = item?.role === 'user' || item?.role === 'assistant' ? item.role : null;
+      const content = typeof item?.content === 'string' ? item.content.trim() : '';
+
+      if (!role || !content) {
+        return null;
+      }
+
+      return { role, content };
+    })
+    .filter((item): item is GpuHistoryMessage => item !== null)
+    .slice(-5);
+};
+
+
+export const validateModel = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { model, provider } = req.body;
+
+    if (!provider || provider === 'local') {
+      // Local model validation (existing logic if any, or just return ok for now)
+      res.json({ valid: true });
+      return;
+    }
+
+    let llmProvider;
+    const normalizedProvider = String(provider).toLowerCase();
+    if (normalizedProvider === 'openrouter') llmProvider = new OpenRouterProvider();
+
+    if (llmProvider) {
+      // Test the model with a very simple, short prompt
+      await llmProvider.generateContent('ping', model, 'Respond only with "pong"');
+      res.json({ valid: true });
+    } else {
+      res.status(400).json({ error: 'Provider không hợp lệ' });
+    }
+  } catch (error: any) {
+    console.error('[validateModel] Error:', error.message);
+    res.status(400).json({ error: error.message });
+  }
+};
 
 export const chatWithAI = async (req: Request, res: Response): Promise<void> => {
-  // Hàm này giờ đây sẽ bị deprecate hoặc dùng làm proxy tới Python infer endpoint mượt hơn
   try {
-    const { text_input, hf_hub_id, message, model, system_prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty } = req.body;
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
 
-    // Hỗ trợ cả payload cũ và mới
+    const {
+      text_input,
+      hf_hub_id,
+      message,
+      model,
+      modelRegistryId, // New: support using production model from registry
+      system_prompt,
+      max_new_tokens,
+      temperature,
+      top_k,
+      top_p,
+      repetition_penalty,
+      provider, // New: external provider like 'openrouter', 'gemini', etc.
+      history
+    } = req.body;
+
     const actualMessage = text_input || message;
-    const actualModelId = hf_hub_id || model;
+    let actualModelId = hf_hub_id || model;
 
-    if (!actualMessage || !actualModelId) {
-      res.status(400).json({ error: 'text_input và hf_model_id là bắt buộc' });
+    // If modelRegistryId is provided, fetch the Use version's HF ID
+    if (modelRegistryId && !actualModelId) {
+      const activeVersion = await ModelVersion.findOne({
+        ownerId,
+        modelRegistryId,
+        status: ModelVersionStatus.USE
+      });
+      if (activeVersion && activeVersion.hfRepoId) {
+        actualModelId = activeVersion.hfRepoId;
+        console.log(`[chatWithAI] Using Active model from Registry ${modelRegistryId}: ${actualModelId}`);
+      } else {
+        res.status(404).json({ error: 'Không tìm thấy phiên bản Active (Use) nào cho Model Registry này.' });
+        return;
+      }
+    }
+
+    if (!actualMessage) {
+      res.status(400).json({ error: 'message là bắt buộc' });
+      return;
+    }
+
+    // --- CASE 1: External LLM Provider (OpenRouter, Gemini, etc.) ---
+    if (provider) {
+      let llmProvider;
+      const normalizedProvider = String(provider).toLowerCase();
+
+      if (normalizedProvider === 'openrouter') {
+        llmProvider = new OpenRouterProvider();
+      }
+
+      if (llmProvider) {
+        console.log(`[chatWithAI] Using external provider: ${normalizedProvider}`);
+        // If using OpenRouter, we can pass the model ID if it looks like a HF model ID or OpenRouter model ID
+        const modelOverride = normalizedProvider === 'openrouter' ? actualModelId : undefined;
+        const reply = await llmProvider.generateContent(actualMessage, modelOverride);
+        res.json({ reply, result: reply });
+        return;
+      }
+    }
+
+    // --- CASE 2: Fine-tuned Model (Local/GPU Service) ---
+    if (!actualModelId) {
+      res.status(400).json({ error: 'hf_model_id là bắt buộc khi không dùng external provider' });
       return;
     }
 
     const { instanceId } = req.body;
     const targetUrl = getGpuUrl(instanceId);
-    
+    const normalizedHistory = normalizeHistory(history);
+
     const inferResponse = await fetch(`${targetUrl}/api/infer`, {
       method: 'POST',
-      headers: { 
+      headers: {
         'Content-Type': 'application/json',
-        'ngrok-skip-browser-warning': 'true' 
+        'ngrok-skip-browser-warning': 'true'
       },
       body: JSON.stringify({
         hf_model_id: actualModelId,
         text_input: actualMessage,
+        history: normalizedHistory,
         instanceId: instanceId ?? 1,
         system_prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty
       })
@@ -54,25 +172,82 @@ export const chatWithAI = async (req: Request, res: Response): Promise<void> => 
 
 export const inferWithAI = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { text_input, hf_model_id, system_prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty } = req.body;
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
 
-    if (!text_input || !hf_model_id) {
-      res.status(400).json({ error: 'text_input và hf_model_id là bắt buộc' });
+    const {
+      text_input,
+      hf_model_id,
+      modelRegistryId, // New: support registry for single inference
+      system_prompt,
+      max_new_tokens,
+      temperature,
+      top_k,
+      top_p,
+      repetition_penalty,
+      provider, // New: support external providers
+      history
+    } = req.body;
+
+    if (!text_input) {
+      res.status(400).json({ error: 'text_input là bắt buộc' });
+      return;
+    }
+
+    let actualModelId = hf_model_id;
+
+    // If modelRegistryId is provided, fetch the Active version's HF ID
+    if (modelRegistryId && !actualModelId) {
+      const activeVersion = await ModelVersion.findOne({
+        ownerId,
+        modelRegistryId,
+        status: ModelVersionStatus.USE
+      });
+      if (activeVersion && activeVersion.hfRepoId) {
+        actualModelId = activeVersion.hfRepoId;
+      } else {
+        res.status(404).json({ error: 'Không tìm thấy phiên bản Active cho Model Registry này.' });
+        return;
+      }
+    }
+
+    // --- CASE 1: External LLM Provider ---
+    if (provider) {
+      let llmProvider;
+      const normalizedProvider = String(provider).toLowerCase();
+      if (normalizedProvider === 'openrouter') llmProvider = new OpenRouterProvider();
+
+      if (llmProvider) {
+        console.log(`[inferWithAI] Using external provider: ${normalizedProvider}`);
+        const result = await llmProvider.generateContent(text_input, actualModelId, system_prompt);
+        res.json({ result });
+        return;
+      }
+    }
+
+    // --- CASE 2: GPU Service ---
+    if (!actualModelId) {
+      res.status(400).json({ error: 'hf_model_id là bắt buộc khi không dùng external provider' });
       return;
     }
 
     const { instanceId } = req.body;
     const targetUrl = getGpuUrl(instanceId);
+    const normalizedHistory = normalizeHistory(history);
 
     const inferResponse = await fetch(`${targetUrl}/api/infer`, {
       method: 'POST',
-      headers: { 
+      headers: {
         'Content-Type': 'application/json',
-        'ngrok-skip-browser-warning': 'true' 
+        'ngrok-skip-browser-warning': 'true'
       },
       body: JSON.stringify({
-        hf_model_id: hf_model_id,
+        hf_model_id: actualModelId,
         text_input: text_input,
+        history: normalizedHistory,
         instanceId: instanceId ?? 1,
         system_prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty
       })
@@ -94,30 +269,94 @@ export const inferWithAI = async (req: Request, res: Response): Promise<void> =>
 
 export const chatWithAIStream = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { text_input, hf_hub_id, message, model, system_prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty } = req.body;
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
 
-    // Support both old and new payload formats
+    const {
+      text_input,
+      hf_hub_id,
+      message,
+      model,
+      modelRegistryId, // New: support using production model from registry
+      system_prompt,
+      max_new_tokens,
+      temperature,
+      top_k,
+      top_p,
+      repetition_penalty,
+      provider,
+      history
+    } = req.body;
+
     const actualMessage = text_input || message;
-    const actualModelId = hf_hub_id || model;
+    let actualModelId = hf_hub_id || model;
 
-    if (!actualMessage || !actualModelId) {
-      res.status(400).json({ error: 'text_input và hf_model_id là bắt buộc' });
+    // If modelRegistryId is provided, fetch the Active (Use) version's HF ID
+    if (modelRegistryId && !actualModelId) {
+      const activeVersion = await ModelVersion.findOne({
+        ownerId,
+        modelRegistryId,
+        status: ModelVersionStatus.USE
+      });
+      if (activeVersion && activeVersion.hfRepoId) {
+        actualModelId = activeVersion.hfRepoId;
+      } else {
+        res.status(404).json({ error: 'Không tìm thấy phiên bản Active (Use) cho Model Registry này.' });
+        return;
+      }
+    }
+
+    if (!actualMessage) {
+      res.status(400).json({ error: 'message là bắt buộc' });
+      return;
+    }
+
+    // --- CASE 1: External Provider (Non-streaming fallback for now) ---
+    if (provider) {
+      let llmProvider;
+      const normalizedProvider = String(provider).toLowerCase();
+      if (normalizedProvider === 'openrouter') llmProvider = new OpenRouterProvider();
+
+      if (llmProvider) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+
+        const modelOverride = normalizedProvider === 'openrouter' ? actualModelId : undefined;
+        const reply = await llmProvider.generateContent(actualMessage, modelOverride);
+
+        res.write(`data: ${JSON.stringify({ text: reply })}\n\n`);
+        res.write(`data: ${JSON.stringify({ is_final: true })}\n\n`);
+        res.end();
+        return;
+      }
+    }
+
+    // --- CASE 2: GPU Service Stream ---
+    if (!actualModelId) {
+      res.status(400).json({ error: 'hf_model_id là bắt buộc khi không dùng external provider' });
       return;
     }
 
     const { instanceId } = req.body;
     const targetUrl = getGpuUrl(instanceId);
+    const normalizedHistory = normalizeHistory(history);
     console.log(`[chatWithAIStream] req.body.instanceId=${JSON.stringify(req.body.instanceId)}, slot=${instanceId ?? 1}`);
 
     const inferResponse = await fetch(`${targetUrl}/api/infer/stream`, {
       method: 'POST',
-      headers: { 
+      headers: {
         'Content-Type': 'application/json',
-        'ngrok-skip-browser-warning': 'true' 
+        'ngrok-skip-browser-warning': 'true'
       },
       body: JSON.stringify({
         hf_model_id: actualModelId,
         text_input: actualMessage,
+        history: normalizedHistory,
         instanceId: instanceId ?? 1,
         system_prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty
       })
@@ -142,10 +381,21 @@ export const chatWithAIStream = async (req: Request, res: Response): Promise<voi
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    // Pipe the response body from Python server to Express response
+    // Manually handle the stream from Python server to Express response
     if (inferResponse.body) {
-      inferResponse.body.pipe(res, { end: false });
-      inferResponse.body.on('end', () => {
+      let streamFinished = false;
+      const reader = (inferResponse.body as any);
+
+      reader.on('data', (chunk: Buffer) => {
+        if (!streamFinished) {
+          res.write(chunk);
+        }
+      });
+
+      const finishStream = () => {
+        if (streamFinished || res.writableEnded) return;
+        streamFinished = true;
+
         const input_parameters = {
           do_sample: true,
           max_new_tokens,
@@ -162,10 +412,15 @@ export const chatWithAIStream = async (req: Request, res: Response): Promise<voi
         });
         res.write(`data: ${finalChunk}\n\n`);
         res.end();
-      });
-      inferResponse.body.on('error', (err) => {
-        console.error('Stream piping error:', err);
-        res.end();
+      };
+
+      reader.on('end', finishStream);
+      reader.on('close', finishStream);
+      reader.on('error', (err: Error) => {
+        console.error('Stream error:', err);
+        if (!res.writableEnded) {
+          res.end();
+        }
       });
     } else {
       res.status(500).json({ error: 'Không nhận được luồng dữ liệu từ GPU service' });
@@ -183,26 +438,89 @@ export const chatWithAIStream = async (req: Request, res: Response): Promise<voi
 
 export const inferWithAIStream = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { text_input, hf_model_id, system_prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty } = req.body;
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
 
-    if (!text_input || !hf_model_id) {
-      res.status(400).json({ error: 'text_input và hf_model_id là bắt buộc' });
+    const {
+      text_input,
+      hf_model_id,
+      modelRegistryId, // New: support registry for single inference stream
+      system_prompt,
+      max_new_tokens,
+      temperature,
+      top_k,
+      top_p,
+      repetition_penalty,
+      provider,
+      history
+    } = req.body;
+
+    if (!text_input) {
+      res.status(400).json({ error: 'text_input là bắt buộc' });
+      return;
+    }
+
+    let actualModelId = hf_model_id;
+
+    // If modelRegistryId is provided, fetch the Active (Use) version's HF ID
+    if (modelRegistryId && !actualModelId) {
+      const activeVersion = await ModelVersion.findOne({
+        ownerId,
+        modelRegistryId,
+        status: ModelVersionStatus.USE
+      });
+      if (activeVersion && activeVersion.hfRepoId) {
+        actualModelId = activeVersion.hfRepoId;
+      } else {
+        res.status(404).json({ error: 'Không tìm thấy phiên bản Active (Use) cho Model Registry này.' });
+        return;
+      }
+    }
+
+    // --- CASE 1: External Provider (Non-streaming fallback) ---
+    if (provider) {
+      let llmProvider;
+      const normalizedProvider = String(provider).toLowerCase();
+      if (normalizedProvider === 'openrouter') llmProvider = new OpenRouterProvider();
+
+      if (llmProvider) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+
+        const result = await llmProvider.generateContent(text_input, actualModelId, system_prompt);
+        res.write(`data: ${JSON.stringify({ text: result })}\n\n`);
+        res.write(`data: ${JSON.stringify({ is_final: true })}\n\n`);
+        res.end();
+        return;
+      }
+    }
+
+    // --- CASE 2: GPU Service Stream ---
+    if (!actualModelId) {
+      res.status(400).json({ error: 'hf_model_id là bắt buộc khi không dùng external provider' });
       return;
     }
 
     const { instanceId } = req.body;
     const targetUrl = getGpuUrl(instanceId);
+    const normalizedHistory = normalizeHistory(history);
     console.log(`[inferWithAIStream] req.body.instanceId=${JSON.stringify(req.body.instanceId)}, slot=${instanceId ?? 1}`);
 
     const inferResponse = await fetch(`${targetUrl}/api/infer/stream`, {
       method: 'POST',
-      headers: { 
+      headers: {
         'Content-Type': 'application/json',
-        'ngrok-skip-browser-warning': 'true' 
+        'ngrok-skip-browser-warning': 'true'
       },
       body: JSON.stringify({
-        hf_model_id: hf_model_id,
+        hf_model_id: actualModelId,
         text_input: text_input,
+        history: normalizedHistory,
         instanceId: instanceId ?? 1,
         system_prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty
       })
@@ -226,10 +544,21 @@ export const inferWithAIStream = async (req: Request, res: Response): Promise<vo
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    // Pipe the response body
+    // Manually handle the stream
     if (inferResponse.body) {
-      inferResponse.body.pipe(res, { end: false });
-      inferResponse.body.on('end', () => {
+      let streamFinished = false;
+      const reader = (inferResponse.body as any);
+
+      reader.on('data', (chunk: Buffer) => {
+        if (!streamFinished) {
+          res.write(chunk);
+        }
+      });
+
+      const finishStream = () => {
+        if (streamFinished || res.writableEnded) return;
+        streamFinished = true;
+
         const input_parameters = {
           do_sample: true,
           max_new_tokens,
@@ -246,10 +575,15 @@ export const inferWithAIStream = async (req: Request, res: Response): Promise<vo
         });
         res.write(`data: ${finalChunk}\n\n`);
         res.end();
-      });
-      inferResponse.body.on('error', (err) => {
-        console.error('Stream piping error:', err);
-        res.end();
+      };
+
+      reader.on('end', finishStream);
+      reader.on('close', finishStream);
+      reader.on('error', (err: Error) => {
+        console.error('Stream error:', err);
+        if (!res.writableEnded) {
+          res.end();
+        }
       });
     } else {
       res.status(500).json({ error: 'Không nhận được luồng dữ liệu từ GPU service' });
@@ -260,21 +594,30 @@ export const inferWithAIStream = async (req: Request, res: Response): Promise<vo
     if (!res.headersSent) {
       res.status(500).json({ error: error.message || 'Có lỗi xảy ra khi gọi Python inference stream', details: error.message });
     } else {
-      res.end(`data: ${JSON.stringify({ error: 'Kết nối stream bị gián đoạn: ' + error.message })}\n\n`);
+      // Send the raw error message so the UI can display it
+      res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+      res.end();
     }
   }
 };
 
 export const saveChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
     const { userMessage, aiMessage, model, responseTime } = req.body;
-    
+
     if (!userMessage || !aiMessage || !model || responseTime === undefined) {
       res.status(400).json({ error: 'Missing required fields' });
       return;
     }
 
     const newHistory = new ChatHistory({
+      ownerId,
       userMessage,
       aiMessage,
       model,
@@ -291,11 +634,17 @@ export const saveChatHistory = async (req: Request, res: Response): Promise<void
 
 export const getChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
     const limit = parseInt(req.query.limit as string) || 20;
-    const history = await ChatHistory.find()
+    const history = await ChatHistory.find({ ownerId })
       .sort({ createdAt: -1 })
       .limit(limit);
-      
+
     res.json(history);
   } catch (error: any) {
     console.error('Get Chat History Error:', error);
@@ -318,9 +667,9 @@ export const loadModel = async (req: Request, res: Response): Promise<void> => {
 
     const loadResponse = await fetch(`${targetUrl}/api/model/load`, {
       method: 'POST',
-      headers: { 
+      headers: {
         'Content-Type': 'application/json',
-        'ngrok-skip-browser-warning': 'true' 
+        'ngrok-skip-browser-warning': 'true'
       },
       body: JSON.stringify({ hf_model_id, instance_id: instanceId ?? 1, system_prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty })
     });
@@ -336,5 +685,98 @@ export const loadModel = async (req: Request, res: Response): Promise<void> => {
   } catch (error: any) {
     console.error('Load Model Proxy Error:', error);
     res.status(500).json({ error: error.message || 'Có lỗi xảy ra khi gọi Python model load', details: error.message });
+  }
+};
+
+export const stopInference = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const slotId = parseInt(req.params.slotId);
+    if (isNaN(slotId) || slotId < 1) {
+      res.status(400).json({ error: 'slotId không hợp lệ' });
+      return;
+    }
+
+    const targetUrl = getGpuUrl(slotId);
+    console.log(`[stopInference] Sending stop signal to slot ${slotId}, url=${targetUrl}`);
+
+    const response = await fetch(`${targetUrl}/api/infer/stop/${slotId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true'
+      }
+    });
+
+    if (!response.ok) {
+      const errorData: any = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || `Lỗi từ GPU service: ${response.statusText}`);
+    }
+
+    const data: any = await response.json();
+    res.json(data);
+  } catch (error: any) {
+    console.error('Stop Inference Proxy Error:', error);
+    res.status(500).json({ error: error.message || 'Có lỗi khi gửi tín hiệu dừng inference' });
+  }
+};
+
+export const unloadModel = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const slotId = parseInt(req.params.slotId);
+    if (isNaN(slotId) || slotId < 1) {
+      res.status(400).json({ error: 'slotId không hợp lệ' });
+      return;
+    }
+
+    const targetUrl = getGpuUrl(slotId);
+    console.log(`[unloadModel] Unloading slot ${slotId}, url=${targetUrl}`);
+
+    const response = await fetch(`${targetUrl}/api/model/unload/${slotId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true'
+      }
+    });
+
+    if (!response.ok) {
+      const errorData: any = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || `Lỗi từ GPU service: ${response.statusText}`);
+    }
+
+    const data: any = await response.json();
+    res.json(data);
+  } catch (error: any) {
+    console.error('Unload Model Proxy Error:', error);
+    res.status(500).json({ error: error.message || 'Có lỗi khi unload model' });
+  }
+};
+
+export const getInferenceLogs = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { inference_id, instanceId } = req.query;
+    const targetUrl = getGpuUrl(instanceId ? Number(instanceId) : undefined);
+
+    let url = `${targetUrl}/api/infer/logs`;
+    if (inference_id) {
+      url += `/${inference_id}`;
+    }
+
+    const response = await fetch(url, {
+      headers: {
+        'ngrok-skip-browser-warning': 'true'
+      }
+    });
+
+    if (!response.ok) {
+      const errorData: any = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || `Lỗi từ Python backend: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    res.json(data);
+  } catch (error: any) {
+    console.error('Get Inference Logs Proxy Error:', error);
+    res.status(500).json({ error: error.message || 'Có lỗi xảy ra khi gọi Python logs', details: error.message });
   }
 };

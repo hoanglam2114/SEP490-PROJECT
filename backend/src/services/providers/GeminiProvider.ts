@@ -12,14 +12,15 @@ export class GeminiProvider implements ILlmProvider {
             model: 'gemini-flash-latest',
             generationConfig: {
                 temperature: 0.1,
-                maxOutputTokens: 8192,
+                maxOutputTokens: 16384,
                 responseMimeType: "application/json",
             }
         });
     }
 
-    async generateContent(prompt: string): Promise<string> {
-        const result = await this.model.generateContent(prompt);
+    async generateContent(prompt: string, _modelOverride?: string, systemPrompt?: string): Promise<string> {
+        const fullPrompt = systemPrompt ? `${systemPrompt}\n\nUser: ${prompt}` : prompt;
+        const result = await this.model.generateContent(fullPrompt);
         const response = await result.response;
         return response.text()?.trim() || '[]';
     }

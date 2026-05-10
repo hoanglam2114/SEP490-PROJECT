@@ -2,49 +2,62 @@ import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
 import FormData from 'form-data';
-import fetch from 'node-fetch';
+const fetch = async (url: any, init?: any) => {
+  const module = await import('node-fetch');
+  return module.default(url, init);
+};
 import dotenv from 'dotenv';
 import { TrainingHistory } from '../models/TrainingHistory';
 import path from 'path';
+import { isZipFile, extractForTraining, cleanupTempDir, DatasetMetadata } from '../services/zipService';
+import { getAuthUserId } from '../utils/auth';
+import { configService } from '../services/configService';
 dotenv.config();
 
-/**
- * GPU Service URLs — set GPU_SERVICE_URL in backend/.env (comma-separated for multiple workers)
- */
-const GPU_SERVICE_URLS = (process.env.GPU_SERVICE_URL || 'http://localhost:5000').split(',').map(url => url.trim());
-
 class WorkerManager {
-  private workers: { url: string; activeJobs: number }[];
+  private workers: { url: string; activeJobs: number }[] = [];
 
-  constructor(urls: string[]) {
-    this.workers = urls.map(url => ({ url, activeJobs: 0 }));
+  constructor() { }
+
+  // Sync workers array with current config
+  private syncWorkers() {
+    const currentUrls = configService.getGpuUrls();
+    // Keep active jobs for existing urls, add new ones, remove missing ones
+    this.workers = currentUrls.map(url => {
+      const existing = this.workers.find(w => w.url === url);
+      return existing || { url, activeJobs: 0 };
+    });
   }
 
   // Pick the worker with the fewest active jobs
   getNextWorker(): string {
+    this.syncWorkers();
     if (this.workers.length === 0) return 'http://localhost:5000';
-    
+
     // Sort by active jobs and pick the first one
     this.workers.sort((a, b) => a.activeJobs - b.activeJobs);
     return this.workers[0].url;
   }
 
   incrementJobs(url: string) {
+    this.syncWorkers();
     const worker = this.workers.find(w => w.url === url);
     if (worker) worker.activeJobs++;
   }
 
   decrementJobs(url: string) {
+    this.syncWorkers();
     const worker = this.workers.find(w => w.url === url);
     if (worker && worker.activeJobs > 0) worker.activeJobs--;
   }
 
   getUrls() {
+    this.syncWorkers();
     return this.workers.map(w => w.url);
   }
 }
 
-const workerManager = new WorkerManager(GPU_SERVICE_URLS);
+const workerManager = new WorkerManager();
 
 const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || '';
 const GOOGLE_DRIVE_CREDENTIALS = process.env.GOOGLE_DRIVE_CREDENTIALS || '';
@@ -100,6 +113,30 @@ async function fetchWithForm(url: string, form: FormData): Promise<ReturnType<ty
   });
 }
 
+async function hfRepoCheckpointProbe(
+  repoId: string,
+  token?: string,
+): Promise<{ result: 'has' | 'no' | 'unknown' | 'not_found' }> {
+  try {
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const response = await fetch(`https://huggingface.co/api/models/${encodeURIComponent(repoId)}`, { headers });
+    if (response.status === 404) return { result: 'not_found' };
+    if (response.status === 401 || response.status === 403) return { result: 'unknown' };
+    if (!response.ok) return { result: 'unknown' };
+
+    const data: any = await response.json();
+    const siblings: any[] = Array.isArray(data?.siblings) ? data.siblings : [];
+    const has = siblings.some((s) => {
+      const name = typeof s?.rfilename === 'string' ? s.rfilename : '';
+      return name.includes('checkpoint-') || name === 'last-checkpoint' || name.startsWith('last-checkpoint/');
+    });
+    return { result: has ? 'has' : 'no' };
+  } catch {
+    return { result: 'unknown' };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/train/start
 // FE sends multipart/form-data (file + params)
@@ -107,7 +144,13 @@ async function fetchWithForm(url: string, form: FormData): Promise<ReturnType<ty
 // to the GPU service as multipart/form-data, then returns the response to FE.
 // ---------------------------------------------------------------------------
 export const startTraining = async (req: Request, res: Response) => {
+  let zipTempDir: string | null = null;
   try {
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const {
       model_name,
       epochs,
@@ -136,9 +179,82 @@ export const startTraining = async (req: Request, res: Response) => {
       projectName,
       datasetSource,
       columnMapping,
+      column_mapping, // Accept both camelCase and snake_case
+      systemPrompt,
+      systemPromptVersion,
     } = req.body;
 
+    console.log('[Backend] Received columnMapping:', columnMapping);
+    console.log('[Backend] Received column_mapping:', column_mapping);
+
+    const finalColumnMapping = columnMapping || column_mapping || 'text';
+    console.log('[Backend] Using finalColumnMapping:', finalColumnMapping);
+
     const datasetFile = req.file; // populated by multer when a file is uploaded
+
+    // ── ZIP Extraction ─────────────────────────────────────────────────────────
+    // If the uploaded file is a ZIP, extract the train dataset + metadata.
+    // The extracted JSON file replaces the original multer file for downstream processing.
+    let zipMetadata: DatasetMetadata | null = null;
+    if (datasetFile && isZipFile(datasetFile.originalname)) {
+      try {
+        const extracted = extractForTraining(datasetFile.path);
+        zipMetadata = extracted.metadata;
+        zipTempDir = extracted.tempDir;
+
+        // Replace multer file properties with the extracted JSON file
+        datasetFile.path = extracted.dataFilePath;
+        datasetFile.originalname = extracted.dataFileName;
+        datasetFile.size = fs.statSync(extracted.dataFilePath).size;
+        datasetFile.mimetype = 'application/json';
+
+        console.log('[Backend] ZIP extracted for training:', extracted.dataFileName);
+        if (zipMetadata) {
+          console.log('[Backend] ZIP metadata found:', JSON.stringify(zipMetadata));
+        }
+      } catch (zipErr: any) {
+        // Clean up original multer file
+        fs.unlink(datasetFile.path, () => { });
+        return res.status(400).json({ error: zipErr.message || 'Failed to extract ZIP file.' });
+      }
+    }
+
+    // ── Local File Column Validation ──────────────────────────────────────────
+    if (datasetFile) {
+      try {
+        const filePath = datasetFile.path;
+        const fileContent = fs.readFileSync(filePath, { encoding: 'utf-8', flag: 'r' });
+
+        let columns: string[] = [];
+        if (datasetFile.originalname.endsWith('.json')) {
+          try {
+            const parsed = JSON.parse(fileContent);
+            const item = Array.isArray(parsed) ? parsed[0] : parsed;
+            if (item && typeof item === 'object') {
+              columns = Object.keys(item);
+            }
+          } catch {
+            // Try JSONL
+            const firstLine = fileContent.split('\n')[0];
+            const parsed = JSON.parse(firstLine);
+            if (parsed && typeof parsed === 'object') {
+              columns = Object.keys(parsed);
+            }
+          }
+        } else if (datasetFile.originalname.endsWith('.csv')) {
+          const firstLine = fileContent.split('\n')[0];
+          columns = firstLine.split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+        }
+
+        if (columns.length > 0 && !columns.includes(finalColumnMapping)) {
+          return res.status(400).json({
+            error: `Column Mapping Error: The column '${finalColumnMapping}' was not found in your dataset file. Detected columns: ${columns.join(', ')}`
+          });
+        }
+      } catch (err) {
+        console.warn('[Backend] Could not validate columns in file:', err);
+      }
+    }
 
     // ── Validation ──────────────────────────────────────────────────────────
     if (!model_name || typeof model_name !== 'string') {
@@ -159,6 +275,7 @@ export const startTraining = async (req: Request, res: Response) => {
     // ── Generate job ID ─────────────────────────────────────────────────────
     const job_id = `job_${uuidv4()}`;
     console.log(`[Backend] Starting job ${job_id} → model=${model_name} epochs=${epochsNum}`);
+
     if (hf_token) {
       console.log(`[Backend] HF Token detected: ${hf_token.substring(0, 4)}****`);
     } else {
@@ -189,9 +306,15 @@ export const startTraining = async (req: Request, res: Response) => {
       push_to_hub: push_to_hub === 'true' || push_to_hub === true,
       hf_repo_id: hf_repo_id || '',
       hf_token: hf_token || '',
+      system_prompt: systemPrompt || '',
       // Google Drive for checkpoint saving
       drive_folder_id: GOOGLE_DRIVE_FOLDER_ID,
       service_account: parsedGoogleCredentials,
+      // Pass column mapping to GPU service in multiple formats to be safe
+      column_mapping: finalColumnMapping,
+      dataset_text_field: finalColumnMapping,
+      text_column: finalColumnMapping,
+      target_column: finalColumnMapping,
     };
 
     // If no file uploaded, embed HF Hub ID directly into config
@@ -201,6 +324,9 @@ export const startTraining = async (req: Request, res: Response) => {
 
     const form = new FormData();
     form.append('config', JSON.stringify(config));
+    // Also append as top-level fields for some GPU service versions
+    form.append('column_mapping', finalColumnMapping);
+    form.append('dataset_text_field', finalColumnMapping);
 
     if (datasetFile) {
       form.append('file', fs.createReadStream(datasetFile.path), {
@@ -258,9 +384,14 @@ export const startTraining = async (req: Request, res: Response) => {
     // --- CREATE INITIAL TRAINING HISTORY RECORD ---
     try {
       await TrainingHistory.create({
+        ownerId,
         jobId: job_id,
         projectName: typeof projectName === 'string' ? projectName : 'AutoTrain Job',
         baseModel: model_name,
+        // Dataset & Prompt traceability from ZIP metadata
+        systemPrompt: systemPrompt || zipMetadata?.systemPrompt || '',
+        systemPromptVersion: systemPromptVersion || zipMetadata?.systemPromptVersion || '',
+        datasetVersionId: zipMetadata?.datasetVersionId || undefined,
         datasetSource: (datasetSource as string) || (datasetFile ? 'local' : 'hub'),
         datasetName: datasetFile ? datasetFile.originalname : dataset,
         columnMapping: (columnMapping as string) || 'text',
@@ -285,11 +416,16 @@ export const startTraining = async (req: Request, res: Response) => {
         },
         pushToHub: String(push_to_hub === 'true' || push_to_hub === true) === 'true',
         hfRepoId: hf_repo_id || '',
-        status: 'QUEUED', // <--- CHANGE: Set initial status to QUEUED
+        status: 'QUEUED',
         trainingDuration: 0,
         startedAt: new Date(),
-        config_snapshot: req.body,
+        config_snapshot: {
+          ...req.body,
+          column_mapping: finalColumnMapping,
+          dataset_text_field: finalColumnMapping,
+        },
         datasetPath: savedDatasetPath,
+        datasetFileId: datasetFile?.filename,
         workerUrl: workerUrl,
       });
       console.log(`[Backend] Initial TrainingHistory created for job ${job_id}`);
@@ -297,10 +433,37 @@ export const startTraining = async (req: Request, res: Response) => {
       console.error('[Backend] Failed to create initial TrainingHistory:', dbErr);
     }
 
+    // Clean up ZIP temp directory if used
+    if (zipTempDir) cleanupTempDir(zipTempDir);
+
     return res.status(gpuResponse.status).json(data);
   } catch (err: any) {
     console.error('[Backend] startTraining error:', err);
+    if (zipTempDir) cleanupTempDir(zipTempDir);
     return res.status(500).json({ error: err.message || 'Failed to start training' });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// GET /api/train/active
+// Returns all active training jobs from MongoDB
+// ---------------------------------------------------------------------------
+export const getActiveTrainingJobs = async (req: Request, res: Response) => {
+  try {
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const activeJobs = await TrainingHistory.find({
+      ownerId,
+      status: { $in: ['QUEUED', 'PENDING', 'LOADING_MODEL', 'TRAINING', 'RUNNING'] }
+    }).sort({ startedAt: -1 });
+
+    return res.json(activeJobs);
+  } catch (err: any) {
+    console.error('[Backend] getActiveTrainingJobs error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to get active jobs' });
   }
 };
 
@@ -310,6 +473,11 @@ export const startTraining = async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 export const getTrainingStatus = async (req: Request, res: Response) => {
   try {
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { jobId } = req.params;
 
     // Guard: never forward obviously invalid IDs
@@ -318,7 +486,10 @@ export const getTrainingStatus = async (req: Request, res: Response) => {
     }
 
     // Get worker URL from DB
-    const history = await TrainingHistory.findOne({ jobId });
+    const history = await TrainingHistory.findOne({ jobId, ownerId });
+    if (!history) {
+      return res.status(404).json({ error: 'Training job not found' });
+    }
     const workerUrl = history?.workerUrl || workerManager.getUrls()[0];
 
     const response = await fetch(`${workerUrl}/api/train/status/${jobId}`, {
@@ -336,6 +507,12 @@ export const getTrainingStatus = async (req: Request, res: Response) => {
 // SSE — polls GPU Service every 1 s and pushes data to the frontend
 // ---------------------------------------------------------------------------
 export const streamTrainingStatus = async (req: Request, res: Response) => {
+  const ownerId = getAuthUserId(req);
+  if (!ownerId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
   const { jobId } = req.params;
 
   // Guard: stop immediately if jobId is invalid — prevents /status/null spam
@@ -353,7 +530,11 @@ export const streamTrainingStatus = async (req: Request, res: Response) => {
   res.flushHeaders();
 
   // Get worker URL from DB
-  const history = await TrainingHistory.findOne({ jobId });
+  const history = await TrainingHistory.findOne({ jobId, ownerId });
+  if (!history) {
+    res.status(404).json({ error: 'Training job not found' });
+    return;
+  }
   const workerUrl = history?.workerUrl || workerManager.getUrls()[0];
 
   const intervalId = setInterval(async () => {
@@ -364,11 +545,27 @@ export const streamTrainingStatus = async (req: Request, res: Response) => {
       const data: any = await response.json();
 
       // IF latest_checkpoint exists, update the DB so we can resume later
-      if (data.latest_checkpoint) {
+      if (data.latest_checkpoint || (data.metrics && (typeof data.metrics.loss === 'number' || typeof data.metrics.eval_loss === 'number'))) {
+        const updateFields: any = {};
+        if (data.latest_checkpoint) {
+          updateFields.latest_checkpoint_file_id = data.latest_checkpoint;
+        }
+
+        const pushFields: any = {};
+        if (data.metrics && typeof data.metrics.loss === 'number') {
+          pushFields.lossHistory = { progress: data.progress || 0, loss: data.metrics.loss };
+        }
+        if (data.metrics && typeof data.metrics.eval_loss === 'number') {
+          pushFields.evalLossHistory = { progress: data.progress || 0, loss: data.metrics.eval_loss };
+        }
+
         TrainingHistory.updateOne(
-          { jobId },
-          { latest_checkpoint_file_id: data.latest_checkpoint }
-        ).catch(err => console.error('[Backend] Failed to update latest_checkpoint:', err));
+          { jobId, ownerId },
+          {
+            ...updateFields,
+            ...(Object.keys(pushFields).length > 0 ? { $push: pushFields } : {})
+          }
+        ).catch(err => console.error('[Backend] Failed to update history during stream:', err));
       }
 
       res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -376,12 +573,33 @@ export const streamTrainingStatus = async (req: Request, res: Response) => {
       // Do not close the stream on UNKNOWN, as it might be a transient state
       // (e.g., job not yet registered by the GPU service). Only close on definitive end-states.
       if (['COMPLETED', 'STOPPED', 'FAILED', 'ERROR'].includes(data.status)) {
+        const workerMetrics = data.metrics || {};
+
+        // Lấy loss từ data hoặc metrics, nhưng phải khác 0
+        // Nếu bằng 0, ta sẽ cố gắng tìm trong history hoặc giữ nguyên giá trị cũ
+        let finalLoss = typeof data.loss === 'number' && data.loss > 0 ? data.loss : (typeof workerMetrics.loss === 'number' ? workerMetrics.loss : 0);
+
+        // Nếu vẫn bằng 0 (do Colab reset ở step cuối), thử lấy từ history đã lưu
+        if (finalLoss === 0 && history && history.lossHistory && history.lossHistory.length > 0) {
+          const lastValid = history.lossHistory.filter(h => h.loss > 0).pop();
+          if (lastValid) finalLoss = lastValid.loss;
+        }
+
+        const finalMetrics = {
+          loss: finalLoss,
+          eval_loss: typeof workerMetrics.eval_loss === 'number' ? workerMetrics.eval_loss : 0,
+          accuracy: typeof workerMetrics.accuracy === 'number' ? workerMetrics.accuracy : 0,
+          vram: typeof workerMetrics.vram === 'number' ? workerMetrics.vram : 0,
+          gpu_util: typeof workerMetrics.gpu_util === 'number' ? workerMetrics.gpu_util : 0,
+        };
+
         // Auto-update MongoDB so History screen shows correct status
         TrainingHistory.updateOne(
-          { jobId },
+          { jobId, ownerId },
           {
             status: data.status,
             completedAt: new Date(),
+            finalMetrics: finalMetrics,
             ...(data.latest_checkpoint ? { latest_checkpoint_file_id: data.latest_checkpoint } : {})
           }
         ).catch(err => console.error('[Backend] Failed to update final status in DB:', err));
@@ -409,17 +627,35 @@ export const streamTrainingStatus = async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 export const stopTraining = async (req: Request, res: Response) => {
   try {
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { jobId } = req.params;
 
     // Get worker URL from DB
-    const history = await TrainingHistory.findOne({ jobId });
+    const history = await TrainingHistory.findOne({ jobId, ownerId });
+    if (!history) {
+      return res.status(404).json({ error: 'Training job not found' });
+    }
     const workerUrl = history?.workerUrl || workerManager.getUrls()[0];
 
-    const response = await fetch(`${workerUrl}/api/train/stop/${jobId}`, { 
+    const response = await fetch(`${workerUrl}/api/train/stop/${jobId}`, {
       method: 'POST',
       headers: { 'ngrok-skip-browser-warning': 'true' }
     });
     const data = await response.json();
+
+    await TrainingHistory.updateOne(
+      { jobId, ownerId },
+      {
+        status: 'STOPPED',
+        completedAt: new Date(),
+      }
+    );
+
+    workerManager.decrementJobs(workerUrl);
     return res.json(data);
   } catch (err: any) {
     return res.status(500).json({ error: err.message || 'Failed to stop training' });
@@ -445,7 +681,7 @@ export const getSystemResources = async (_req: Request, res: Response) => {
     });
 
     const results: any[] = await Promise.all(resourcePromises);
-    
+
     // Aggregated resources for backward compatibility if needed, 
     // or just return the list of workers
     return res.json({
@@ -465,13 +701,23 @@ export const getSystemResources = async (_req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 export const resumeTraining = async (req: Request, res: Response) => {
   try {
+    const ownerId = getAuthUserId(req);
+    if (!ownerId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { jobId } = req.params;
 
     // 1. Fetch Job from MongoDB
-    const history = await TrainingHistory.findOne({ jobId });
+    const history = await TrainingHistory.findOne({ jobId, ownerId });
     if (!history) {
       return res.status(404).json({ error: 'Job not found in database' });
     }
+
+    const snapshotConfig = history.config_snapshot || {};
+    const resumeHfToken =
+      (typeof snapshotConfig.hf_token === 'string' ? snapshotConfig.hf_token : '') ||
+      (typeof history.hfToken === 'string' ? history.hfToken : '');
 
     // Determine checkpoint source:
     // Priority 1: latest_checkpoint_file_id (e.g. Google Drive file ID)
@@ -489,11 +735,25 @@ export const resumeTraining = async (req: Request, res: Response) => {
       });
     }
 
+    if (checkpointSource === 'hf') {
+      const probe = await hfRepoCheckpointProbe(checkpointId, resumeHfToken);
+      if (probe.result === 'not_found') {
+        return res.status(400).json({
+          error:
+            'Cannot resume: Hugging Face repo not found (or not accessible). Check hf_repo_id and token permissions.',
+        });
+      }
+      if (probe.result === 'no') {
+        return res.status(400).json({
+          error:
+            'Cannot resume: No checkpoint found in Hugging Face repo yet (checkpoint-* or last-checkpoint). If you stopped before the first save, it will restart from step 1. Wait until a checkpoint is saved (e.g. after save_steps) then try Resume again.'
+        });
+      }
+    }
+
     console.log(`[Backend] Resuming job ${jobId} from checkpoint [${checkpointSource}]: ${checkpointId}`);
 
     // 2. Reconstruct JSON config from stored snapshot
-    const snapshotConfig = history.config_snapshot || {};
-
     const resumeConfig: any = {
       ...snapshotConfig,
       job_id: jobId,
@@ -553,7 +813,7 @@ export const resumeTraining = async (req: Request, res: Response) => {
     }
 
     if (gpuResponse.ok) {
-      await TrainingHistory.updateOne({ jobId }, { 
+      await TrainingHistory.updateOne({ jobId, ownerId }, {
         status: 'RUNNING',
         workerUrl: workerUrl
       });

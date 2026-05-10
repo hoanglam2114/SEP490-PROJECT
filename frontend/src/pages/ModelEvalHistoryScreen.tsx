@@ -1,26 +1,33 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
+import { getAuthToken } from '../services/authSession';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 interface EvalSummary {
-  overall: { base_avg: number; ft_avg: number; improvement_pct: number } | null;
-  quality: { base_avg: number; ft_avg: number; weight: number } | null;
-  hallucination: { base_avg: number; ft_avg: number; weight: number } | null;
-  speed: { ft_score: number; ft_avg_ms: number; weight: number } | null;
+  overall: number | null;
+  group_a: number | null;
+  group_b: number | null;
+  group_c: number | null;
+  group_d: number | null;
+  criteria?: Record<string, number>;
+  avg_latency_ms?: number;
+  non_scoring?: { bleu: number; rouge_l: number; question_detection_rate: number };
 }
 
 interface EvalRun {
   modelEvalId: string;
   jobId: string;
   status: string;
-  totalSamples: number;
+  totalConversations: number;
   judgeModel: string;
   summary: EvalSummary;
   startedAt: string;
   completedAt: string;
   isPinned: boolean;
+  systemPromptVersion?: string;
+  datasetVersionName?: string;
 }
 
 interface HistoryResponse {
@@ -72,6 +79,7 @@ export function ModelEvalHistoryScreen() {
   const [data, setData] = useState<HistoryResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [unauthorized, setUnauthorized] = useState(false);
 
   // Compare mode: chọn tối đa 2 run
   const [compareIds, setCompareIds] = useState<string[]>([]);
@@ -86,9 +94,18 @@ export function ModelEvalHistoryScreen() {
   useEffect(() => {
     if (!jobId) return;
     setLoading(true);
-    fetch(`/api/model-eval/history/${jobId}`)
-      .then(r => r.json())
-      .then((json: HistoryResponse) => {
+    const token = getAuthToken();
+    fetch(`/api/model-eval/history/${jobId}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+      .then(r => {
+        if (r.status === 401) { setUnauthorized(true); setLoading(false); return null; }
+        if (!r.ok) throw new Error(`Lỗi server: ${r.status} ${r.statusText}`);
+        return r.json();
+      })
+      .then((json: HistoryResponse | null) => {
+        if (!json) return;
+        if (!Array.isArray(json.evals)) throw new Error('Dữ liệu trả về không hợp lệ');
         setData(json);
         setLoading(false);
       })
@@ -106,7 +123,11 @@ export function ModelEvalHistoryScreen() {
     if (!window.confirm('Xóa bản đánh giá này? Không thể hoàn tác.')) return;
     setDeleting(evalId);
     try {
-      const res = await fetch(`/api/model-eval/${encodeURIComponent(evalId)}`, { method: 'DELETE' });
+      const token = getAuthToken();
+      const res = await fetch(`/api/model-eval/${encodeURIComponent(evalId)}`, {
+        method: 'DELETE',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       const json = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error((json as { error?: string }).error || 'Xóa thất bại');
       const newPinned = (json as { newPinnedEvalId?: string | null }).newPinnedEvalId ?? data.pinnedEvalId;
@@ -132,7 +153,11 @@ export function ModelEvalHistoryScreen() {
     if (!data) return;
     setPinning(evalId);
     try {
-      const res = await fetch(`/api/model-eval/pin/${evalId}`, { method: 'POST' });
+      const token = getAuthToken();
+      const res = await fetch(`/api/model-eval/pin/${evalId}`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       if (!res.ok) throw new Error('Pin thất bại');
       // Cập nhật local state
       setData(prev => {
@@ -161,6 +186,39 @@ export function ModelEvalHistoryScreen() {
   // ---------------------------------------------------------------------------
   // Loading / Error
   // ---------------------------------------------------------------------------
+  if (unauthorized) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="bg-white border border-slate-200 rounded-xl p-8 max-w-sm w-full text-center shadow-sm">
+          <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
+            <svg className="w-6 h-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+                d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+            </svg>
+          </div>
+          <p className="text-sm font-semibold text-slate-800 mb-1">Cần đăng nhập</p>
+          <p className="text-xs text-slate-500 mb-5">
+            Tính năng lịch sử đánh giá chỉ dành cho tài khoản đã đăng nhập.
+          </p>
+          <div className="flex gap-2 justify-center">
+            <button
+              onClick={() => navigate('/model-eval/leaderboard')}
+              className="px-4 py-2 text-xs font-medium border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors"
+            >
+              ← Quay lại
+            </button>
+            <button
+              onClick={() => navigate('/login')}
+              className="px-4 py-2 text-xs font-semibold bg-slate-800 text-white rounded-lg hover:bg-slate-700 transition-colors"
+            >
+              Đăng nhập
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (loading) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center">
@@ -171,8 +229,25 @@ export function ModelEvalHistoryScreen() {
 
   if (error || !data) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
-        <div className="text-red-500 text-sm">{error || 'Không tìm thấy dữ liệu'}</div>
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="bg-white border border-red-100 rounded-xl p-6 max-w-sm w-full text-center">
+          <p className="text-sm font-semibold text-red-600 mb-1">Không thể tải dữ liệu</p>
+          <p className="text-xs text-slate-500 mb-4">{error || 'Không tìm thấy dữ liệu'}</p>
+          <div className="flex gap-2 justify-center">
+            <button
+              onClick={() => navigate('/model-eval/leaderboard')}
+              className="px-4 py-2 text-xs font-medium border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors"
+            >
+              ← Quay lại
+            </button>
+            <button
+              onClick={() => window.location.reload()}
+              className="px-4 py-2 text-xs font-semibold bg-slate-800 text-white rounded-lg hover:bg-slate-700 transition-colors"
+            >
+              Thử lại
+            </button>
+          </div>
+        </div>
       </div>
     );
   }
@@ -230,7 +305,7 @@ export function ModelEvalHistoryScreen() {
                 Pinned
               </span>
               <span>
-                {pinnedEval.modelEvalId} · {judgeLabel(pinnedEval.judgeModel)} · {pinnedEval.totalSamples} samples
+                {pinnedEval.modelEvalId} · {judgeLabel(pinnedEval.judgeModel)} · {pinnedEval.totalConversations} conversations
               </span>
             </div>
           )}
@@ -261,22 +336,23 @@ export function ModelEvalHistoryScreen() {
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500">#</th>
                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500">Ngày</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500">Dataset/Prompt</th>
                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500">Judge</th>
-                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500">Samples</th>
+                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500">Convs</th>
                     <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500">Overall</th>
-                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500">Quality</th>
-                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500">Hallucination</th>
-                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500">Speed</th>
+                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500">Socratic</th>
+                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500">Accuracy</th>
+                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500">Pedagogy</th>
                     <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500">Status</th>
                     <th className="px-4 py-3 text-right text-xs font-semibold text-slate-500">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-50">
                   {evals.map((e, i) => {
-                    const overall = e.summary?.overall?.ft_avg ?? null;
-                    const quality = e.summary?.quality?.ft_avg ?? null;
-                    const hall = e.summary?.hallucination?.ft_avg ?? null;
-                    const speed = e.summary?.speed?.ft_score ?? null;
+                    const overall = e.summary?.overall ?? null;
+                    const socratic = e.summary?.group_a ?? null;
+                    const accuracy = e.summary?.group_b ?? null;
+                    const pedagogy = e.summary?.group_c ?? null;
                     const isSelected = compareIds.includes(e.modelEvalId);
                     const canSelect = isSelected || compareIds.length < 2;
 
@@ -307,6 +383,12 @@ export function ModelEvalHistoryScreen() {
                           <div className="text-[10px] text-slate-400 mt-0.5 font-mono truncate max-w-[140px]">{e.modelEvalId}</div>
                         </td>
 
+                        {/* Dataset/Prompt */}
+                        <td className="px-4 py-3">
+                          <div className="text-xs font-semibold text-slate-700">{e.datasetVersionName || '—'}</div>
+                          <div className="text-[10px] text-indigo-600 mt-0.5 font-medium">{e.systemPromptVersion || '—'}</div>
+                        </td>
+
                         {/* Judge */}
                         <td className="px-4 py-3">
                           <span className="text-xs bg-slate-100 text-slate-600 px-2 py-1 rounded font-mono">
@@ -315,13 +397,14 @@ export function ModelEvalHistoryScreen() {
                         </td>
 
                         {/* Samples */}
-                        <td className="px-4 py-3 text-center text-xs text-slate-600">{e.totalSamples}</td>
+                        {/* Convs */}
+                        <td className="px-4 py-3 text-center text-xs text-slate-600">{e.totalConversations}</td>
 
                         {/* Scores */}
                         <td className="px-4 py-3 text-center"><ScorePill value={overall} /></td>
-                        <td className="px-4 py-3 text-center"><ScorePill value={quality} /></td>
-                        <td className="px-4 py-3 text-center"><ScorePill value={hall} /></td>
-                        <td className="px-4 py-3 text-center"><ScorePill value={speed} /></td>
+                        <td className="px-4 py-3 text-center"><ScorePill value={socratic} /></td>
+                        <td className="px-4 py-3 text-center"><ScorePill value={accuracy} /></td>
+                        <td className="px-4 py-3 text-center"><ScorePill value={pedagogy} /></td>
 
                         {/* Pin badge */}
                         <td className="px-4 py-3 text-center">
@@ -396,8 +479,7 @@ export function ModelEvalHistoryScreen() {
               </button>
               <button
                 onClick={() => navigate(`/model-eval/compare?a=${compareIds[0]}&b=${compareIds[1]}`)}
-                className="text-sm font-semibold bg-slate-800 text-white px-4 py-2 rounded-lg hover:bg-slate-700 transition"
-              >
+                className="text-sm font-semibold bg-slate-800 text-white px-4 py-2 rounded-lg hover:bg-slate-700 transition">
                 So sánh →
               </button>
             </div>

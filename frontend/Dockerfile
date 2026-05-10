@@ -1,31 +1,27 @@
+# ─── Stage 1: Build ───────────────────────────────────────────────────────────
 FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install
+COPY package*.json ./
+RUN npm install --legacy-peer-deps
 
 COPY . .
-
-# VITE_API_URL=/api → frontend gọi /api/... → Nginx proxy về backend
-ARG VITE_API_URL=/api
-ENV VITE_API_URL=$VITE_API_URL
-
 RUN npm run build
 
-# ── Stage 2: Serve static files ──────────────────────────
-FROM nginx:alpine
+# ─── Stage 2: Serve with Nginx ────────────────────────────────────────────────
+FROM nginx:alpine AS production
 
+# Remove default nginx config
+RUN rm /etc/nginx/conf.d/default.conf
+
+# Copy custom nginx config
+COPY nginx.conf /etc/nginx/conf.d/app.conf
+
+# Copy built static files from builder
 COPY --from=builder /app/dist /usr/share/nginx/html
 
-# Config nginx cho React SPA (handle client-side routing)
-RUN echo 'server { \
-    listen 80; \
-    root /usr/share/nginx/html; \
-    index index.html; \
-    location / { \
-        try_files $uri $uri/ /index.html; \
-    } \
-}' > /etc/nginx/conf.d/default.conf
-
 EXPOSE 80
+EXPOSE 443
+
+CMD ["nginx", "-g", "daemon off;"]

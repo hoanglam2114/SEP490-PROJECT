@@ -1,9 +1,13 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
 export interface ITrainingHistory extends Document {
+  ownerId: mongoose.Types.ObjectId;
   jobId: string;
   projectName: string;
   baseModel: string;
+  systemPrompt?: string;
+  systemPromptVersion?: string;
+  datasetVersionId?: mongoose.Types.ObjectId | string;
   datasetSource: string;       // 'local' | 'hub'
   datasetName: string;         // filename hoặc HuggingFace Hub ID
   columnMapping: string;
@@ -40,6 +44,8 @@ export interface ITrainingHistory extends Document {
   trainingDuration: number;    // thời gian thực tế (milliseconds)
   startedAt: Date;
   completedAt?: Date;
+  lossHistory?: { progress: number; loss: number; timestamp?: Date }[];
+  evalLossHistory?: { progress: number; loss: number; timestamp?: Date }[];
   createdAt: Date;
   updatedAt: Date;
 
@@ -51,14 +57,19 @@ export interface ITrainingHistory extends Document {
   drive_folder_id?: string;
   config_snapshot?: any;
   datasetPath?: string;
+  datasetFileId?: string; // ID từ Multer hoặc File System
   workerUrl?: string;
 }
 
 const TrainingHistorySchema = new Schema<ITrainingHistory>(
   {
+    ownerId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     jobId: { type: String, required: true, unique: true, index: true },
     projectName: { type: String, required: true },
     baseModel: { type: String, required: true, index: true },
+    systemPrompt: { type: String, default: '' },
+    systemPromptVersion: { type: String, default: '' },
+    datasetVersionId: { type: Schema.Types.ObjectId, ref: 'DatasetVersion' },
     datasetSource: { type: String, required: true },
     datasetName: { type: String, required: true },
     columnMapping: { type: String, default: 'text' },
@@ -87,6 +98,7 @@ const TrainingHistorySchema = new Schema<ITrainingHistory>(
     status: { type: String, required: true },
     finalMetrics: {
       loss: { type: Number },
+      eval_loss: { type: Number },
       accuracy: { type: Number },
       vram: { type: Number },
       gpu_util: { type: Number },
@@ -95,6 +107,20 @@ const TrainingHistorySchema = new Schema<ITrainingHistory>(
     trainingDuration: { type: Number, default: 0 },  // ms
     startedAt: { type: Date, required: true },
     completedAt: { type: Date },
+    lossHistory: [
+      {
+        progress: { type: Number },
+        loss: { type: Number },
+        timestamp: { type: Date, default: Date.now },
+      },
+    ],
+    evalLossHistory: [
+      {
+        progress: { type: Number },
+        loss: { type: Number },
+        timestamp: { type: Date, default: Date.now },
+      },
+    ],
 
     // Model Evaluation
     pinnedEvalId: { type: String, default: null },
@@ -104,6 +130,7 @@ const TrainingHistorySchema = new Schema<ITrainingHistory>(
     drive_folder_id: { type: String },
     config_snapshot: { type: Schema.Types.Mixed }, // Store arbitrary JSON config
     datasetPath: { type: String },
+    datasetFileId: { type: String },
     workerUrl: { type: String },
   },
   {
